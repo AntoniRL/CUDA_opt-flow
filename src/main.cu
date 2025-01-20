@@ -1,4 +1,5 @@
 #include "bmpIO.h"
+#include "ppmIO.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,39 +7,82 @@
 #include <cuda_runtime.h>
 #include <string>
 
-/**
- * Kernel do obliczania gradientów Ix, Iy oraz różnicy It = N2 - N1
- * zakładamy, że:
- *   - dN1, dN2 to obrazy wejściowe w GPU
- *   - dIx, dIy, dIt to tablice, do których zapisujemy wyniki
- *   - width, height rozmiary obrazka
- *
- * Używamy prostego operatora różnicowego:
- *   Ix = (I(x+1,y) - I(x-1,y)) / 2
- *   Iy = (I(x,y+1) - I(x,y-1)) / 2
- */
-__global__ void computeGradients(const float* __restrict__ dN1,
-                                 const float* __restrict__ dN2,
-                                 float* __restrict__ dIx,
-                                 float* __restrict__ dIy,
-                                 float* __restrict__ dIt,
-                                 int width, int height)
+#define TILE_SIZE 16
+
+__global__ void rgb2gray(float *grayImage, float *rgbImage, int channels, int width, int height)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+
+    if (x < width && y < height)
+    {
+        // get 1D coordinate for the grayscale image
+        int grayOffset = y * width + x;
+        // one can think of the RGB image having
+        // CHANNEL times columns than the gray scale image
+        int rgbOffset = grayOffset * channels;
+        float r = rgbImage[rgbOffset];     // red value for pixel
+        float g = rgbImage[rgbOffset + 1]; // green value for pixel
+        float b = rgbImage[rgbOffset + 2]; // blue value for pixel
+        // perform the rescaling and store it
+        // We multiply by floating point constants
+        grayImage[grayOffset] = 0.21f * r + 0.71f * g + 0.07f * b;
+    }
+}
+
+/*
+* Kernel do konwersji przepływu optycznego na obraz RGB.
+*/
+__global__ void  FlowToRGB_Kernel(float* d_u, 
+                                  float* d_v, 
+                                  float* d_O, 
+                                  int width, int height)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x < 1 || x >= width - 1) return;
-    if (y < 1 || y >= height - 1) return;
+    if (x < width && y < height) {
+        int idx = y * width + x;
+        float u = d_u[idx];
+        float v = d_v[idx];
 
-    int idx = y * width + x;
+        // Normalizacja przepływu
+        float mag = sqrtf(u * u + v * v);
+        float angle = atan2f(v, u);
 
-    float Ix = (dN1[y * width + (x+1)] - dN1[y * width + (x-1)]) * 0.5f;
-    float Iy = (dN1[(y+1) * width + x] - dN1[(y-1) * width + x]) * 0.5f;
-    float It = dN2[idx] - dN1[idx];
+        float normalized_angle = (angle + M_PI) / (2.0f * M_PI);
 
-    dIx[idx] = Ix;
-    dIy[idx] = Iy;
-    dIt[idx] = It;
+        float S = 1.0f, V = 1.0f;
+        float H = normalized_angle * 360.0f;
+
+        float r, g, b;
+        float C = V * S;
+        float X = C * (1 - fabsf(fmodf(H / 60.0f, 2) - 1));
+        float m = V - C;
+
+        if (H >= 0 && H < 60) {
+            r = C; g = X; b = 0;
+        } else if (H >= 60 && H < 120) {
+            r = X; g = C; b = 0;
+        } else if (H >= 120 && H < 180) {
+            r = 0; g = C; b = X;
+        } else if (H >= 180 && H < 240) {
+            r = 0; g = X; b = C;
+        } else if (H >= 240 && H < 300) {
+            r = X; g = 0; b = C;
+        } else {
+            r = C; g = 0; b = X;
+        }
+
+        r += m * 255.0f;
+        g += m * 255.0f;
+        b += m * 255.0f;
+        
+        // Przypisanie wartości do tablicy wyjściowej
+        d_O[3 * idx + 0] = r;
+        d_O[3 * idx + 1] = g;
+        d_O[3 * idx + 2] = b;
+    }
 }
 
 /**
@@ -50,62 +94,66 @@ __global__ void computeGradients(const float* __restrict__ dN1,
  * dU, dV       : tu zapisujemy wynikowy wektor przepływu (u,v)
  * width, height
  */
-__global__ void lucasKanadeKernel(const float* __restrict__ dIx,
-                                  const float* __restrict__ dIy,
-                                  const float* __restrict__ dIt,
-                                  float* __restrict__ dU,
-                                  float* __restrict__ dV,
+__global__ void LukasKanadeKernel(const float* d_N1,
+                                  const float* d_N2,
+                                  float* d_u,
+                                  float* d_v,
                                   int width, int height,
                                   int r) // promień okienka
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
+    // TODO : Pamięć współdzielona
+
     // Pomijamy piksele na brzegu
     if (x < r || x >= width - r) return;
     if (y < r || y >= height - r) return;
 
-    float A11 = 0.0f, A12 = 0.0f, A21 = 0.0f, A22 = 0.0f;
+    // liczymy gradient dla piksela (Matlab metoda 'central')
+    int idx = y * width + x;
+
+    
+
+    // Macierz A i wektor B
+    float A11 = 0.0f, A12_21 = 0.0f, A22 = 0.0f;
     float B1  = 0.0f, B2  = 0.0f;
 
     // Sumowanie w małym oknie
     for (int dy = -r; dy <= r; dy++) {
         for (int dx = -r; dx <= r; dx++) {
-            int xx = x + dx;
-            int yy = y + dy;
-            int idx = yy * width + xx;
+            // liczymy gradient dla piksela (Matlab metoda 'central')
+            int current_idx = (y + dy) * width + (x + dx);
 
-            float ix = dIx[idx];
-            float iy = dIy[idx];
-            float it = dIt[idx];
+            float Ix = (d_N1[current_idx + 1] - d_N1[current_idx - 1]) * 0.5f;
+            float Iy = (d_N1[current_idx + width] - d_N1[current_idx - 1]) * 0.5f;
+            float It = d_N2[idx] - d_N1[idx];
 
             // Macierz A = sum( [ix^2  ix*iy ; ix*iy  iy^2 ] )
-            A11 += ix * ix;
-            A12 += ix * iy;
-            A21 += ix * iy;
-            A22 += iy * iy;
+            A11 += Ix*Ix;
+            A12_21 += Ix*Iy;
+            A22 += Iy*Iy;
 
             // Wektor B = - sum( [ix*it ; iy*it] )
-            B1  -= ix * it;
-            B2  -= iy * it;
+            B1 -= Ix*It;
+            B2 -= Iy*It;
         }
     }
 
     // Wyznacznik
-    float det = A11 * A22 - A12 * A21;
-    if (fabs(det) < 1e-6f) {
+    float det = A11 * A22 - A12_21 * A12_21;
+    if (fabs(det) > 1e-6f) {
+        // Rozwiązanie układu 2x2
+        float u = (A22 * B1 - A12_21 * B2) / det;
+        float v = (A11 * B2 - A12_21 * B1) / det;
+    } else {
         // Jeśli macierz prawie osobliwa, u = v = 0
-        dU[y * width + x] = 0.0f;
-        dV[y * width + x] = 0.0f;
-        return;
+        v = 0.0f;
+        u = 0.0f;
     }
 
-    // Rozwiązanie układu 2x2
-    float u = (A22 * B1 - A12 * B2) / det;
-    float v = (A11 * B2 - A21 * B1) / det;
-
-    dU[y * width + x] = u;
-    dV[y * width + x] = v;
+    d_u[y * width + x] = u;
+    d_v[y * width + x] = v;
 }
 
 /**
@@ -172,226 +220,94 @@ int main(int argc, char** argv)
 
     const char* file1 = argv[1];
     const char* file2 = argv[2];
-    std::string method = argv[3];
+    const char* output_file = argv[3];
+    std::string method = argv[4];
 
     // --- Wczytanie bitmap
     unsigned int width, height;
     getBMPSize(file1, &width, &height);
 
-    float* hN1 = (float*)malloc(width * height * sizeof(float));
-    float* hN2 = (float*)malloc(width * height * sizeof(float));
+    float* h_N1 = (float*)malloc(width * height * sizeof(float));
+    float* h_N2 = (float*)malloc(width * height * sizeof(float));
 
-    readBMP(file1, hN1, /*isGray=*/true);
-    readBMP(file2, hN2, /*isGray=*/true);
-
+    readBMP(file1, h_N1, /*isGray=*/true);
+    readBMP(file2, h_N2, /*isGray=*/true);
 
     printf("Wczytano plik1: %s\n", file1);
     printf("Wczytano plik2: %s\n", file2);
     printf("width = %d, height = %d\n", width, height);
 
-    // Wypisz kilka pierwszych pikseli obrazu 1
-    printf("Pierwsze 10 pikseli obrazu 1 (hN1):\n");
-    for (int i = 0; i < 10 && i < width*height; i++) {
-        printf("%.1f ", hN1[i]);
-    }
-    printf("\n");
-
-    // Wypisz kilka pierwszych pikseli obrazu 2 (hN2):
-    printf("Pierwsze 10 pikseli obrazu 2 (hN2):\n");
-    for (int i = 0; i < 10 && i < width*height; i++) {
-        printf("%.1f ", hN2[i]);
-    }
-    printf("\n");
-
-    // Opcjonalnie sprawdź różnicę piksel po pikselu
-    printf("Pierwsze 10 różnic (N2 - N1):\n");
-    for (int i = 0; i < 10 && i < width*height; i++) {
-        float diff = hN2[i] - hN1[i];
-        printf("%.1f ", diff);
-    }
-    printf("\n");
-
-
     // --- Alokacja GPU
-    float *dN1, *dN2, *dIx, *dIy, *dIt;
-    cudaMalloc((void**)&dN1,  width * height * sizeof(float));
-    cudaMalloc((void**)&dN2,  width * height * sizeof(float));
-    cudaMalloc((void**)&dIx,  width * height * sizeof(float));
-    cudaMalloc((void**)&dIy,  width * height * sizeof(float));
-    cudaMalloc((void**)&dIt,  width * height * sizeof(float));
+    float *d_N1, *d_N2;
+    cudaMalloc((void**)&d_N1,  width * height * sizeof(float));
+    cudaMalloc((void**)&d_N2,  width * height * sizeof(float));
 
-    cudaMemcpy(dN1, hN1, width * height * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dN2, hN2, width * height * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Obliczenie gradientów
-    dim3 block(16, 16);
-    dim3 grid((width+block.x-1)/block.x, (height+block.y-1)/block.y);
-    computeGradients<<<grid, block>>>(dN1, dN2, dIx, dIy, dIt, width, height);
-    cudaDeviceSynchronize();
-
-        // Skopiuj gradienty na CPU
-    float* hIx = (float*)malloc(width * height * sizeof(float));
-    float* hIy = (float*)malloc(width * height * sizeof(float));
-    float* hIt = (float*)malloc(width * height * sizeof(float));
-
-    cudaMemcpy(hIx, dIx, width * height * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(hIy, dIy, width * height * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(hIt, dIt, width * height * sizeof(float), cudaMemcpyDeviceToHost);
-
-    printf("DEBUG: Po computeGradients, Ix od indeksu 257 do 266:\n");
-    int start = width + 1;  // (x=1, y=1) w pamięci, bo y*width + x
-    for (int i = 0; i < 10; i++) {
-        printf("%.3f ", hIx[start + i]);
-    }
-    printf("\n");
-
-
+    cudaMemcpy(d_N1, h_N1, width * height * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_N2, h_N2, width * height * sizeof(float), cudaMemcpyHostToDevice);
 
     // Przygotowanie tablic na wyniki (U, V)
-    float *dU, *dV; 
-    cudaMalloc((void**)&dU, width * height * sizeof(float));
-    cudaMalloc((void**)&dV, width * height * sizeof(float));
-    cudaMemset(dU, 0, width * height * sizeof(float));
-    cudaMemset(dV, 0, width * height * sizeof(float));
+    float *d_u, *d_v; 
+    cudaMalloc((void**)&d_u, width * height * sizeof(float));
+    cudaMalloc((void**)&d_v, width * height * sizeof(float));
+    cudaMemset(d_u, 0, width * height * sizeof(float));
+    cudaMemset(d_v, 0, width * height * sizeof(float));
 
     // Hostowe tablice na wynik przepływu
-    float* hU = (float*)malloc(width * height * sizeof(float));
-    float* hV = (float*)malloc(width * height * sizeof(float));
+    float* h_u = (float*)malloc(width * height * sizeof(float));
+    float* h_v = (float*)malloc(width * height * sizeof(float));
 
     if (method == "LK") {
         printf("=== Lucas–Kanade ===\n");
-        // Ustawmy promień okna (np. 2 => okno 5x5)
-        int r = 10;
-        lucasKanadeKernel<<<grid, block>>>(dIx, dIy, dIt, dU, dV, width, height, r);
+        // Ustawmy promień okna (np. 4 => okno 9x9)
+        int r = 4;
+
+        dim3 dimBlock(TILE_SIZE, TILE_SIZE, 1);
+        dim3 dimGrid((width + TILE_SIZE - 1) / TILE_SIZE, (height + TILE_SIZE - 1) / TILE_SIZE, 1);
+        LukasKanadeKernel<<<dimGrid, dimBlock>>>(d_N1, d_N2, d_u, d_v, width, height, r);
         cudaDeviceSynchronize();
-
-        // Zczytujemy U, V
-        cudaMemcpy(hU, dU, width * height * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(hV, dV, width * height * sizeof(float), cudaMemcpyDeviceToHost);
-
-        printf("DEBUG: Po %s, pierwsze 100 pikseli (U, V):\n", method.c_str());
-        for (int i = 0; i < 100; i++) {
-            printf("(%7.3f, %7.3f) ", hU[i], hV[i]);
-        }
-        printf("\n");
-        int nonZeroCount = 0;
-
-        for (int i = 0; i < width*height; i++) {
-            if (fabs(hU[i]) > 1e-5f || fabs(hV[i]) > 1e-5f) nonZeroCount++;
-        }
-        printf("Liczba pikseli, gdzie (u,v) != 0: %d\n", nonZeroCount);
 
     } else if (method == "HS") {
         printf("=== Horn–Schunck ===\n");
-        // Alokacja tymczasowych tablic do iteracyjnej aktualizacji
-        float *dUnew, *dVnew;
-        cudaMalloc((void**)&dUnew, width * height * sizeof(float));
-        cudaMalloc((void**)&dVnew, width * height * sizeof(float));
 
-        float alpha = 100.0f;    // regularization
-        int   nIter = 1000;     // liczba iteracji
-
-        for (int i = 0; i < nIter; i++) {
-            hornSchunckIteration<<<grid, block>>>(
-                dIx, dIy, dIt,
-                dU, dV,         // stara
-                dUnew, dVnew,   // nowa
-                width, height, alpha
-            );
-            cudaDeviceSynchronize();
-
-            // Zamiana wskaźników (dUnew -> dU, dVnew -> dV)
-            // zamiast kopiować pamięć, robimy "swap"
-            float* tmpU = dU; dU = dUnew; dUnew = tmpU;
-            float* tmpV = dV; dV = dVnew; dVnew = tmpV;
-        }
-
-        // Po iteracjach w dU, dV mamy wynik
-        cudaMemcpy(hU, dU, width * height * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(hV, dV, width * height * sizeof(float), cudaMemcpyDeviceToHost);
-
-        printf("DEBUG: Po %s, pierwsze 100 pikseli (U, V):\n", method.c_str());
-        for (int i = 0; i < 100; i++) {
-            printf("(%7.3f, %7.3f) ", hU[i], hV[i]);
-        }
-        printf("\n");
-
-        cudaFree(dUnew);
-        cudaFree(dVnew);
+        // TODO : Horn–Schunck
 
     } else {
         printf("Metoda nie rozpoznana! Użyj 'LK' lub 'HS'.\n");
         return 0;
     }
 
-    // Tworzymy wynikowy obraz – magnituda przepływu
-    float* hFlow = (float*)malloc(width * height * sizeof(float));
-    for (unsigned int i = 0; i < width * height; i++) {
-        float mag = sqrtf(hU[i]*hU[i] + hV[i]*hV[i]);
-        hFlow[i] = mag;
-    }
+    // Konwersja przepływu do RGB
+    float *d_O;
+    cudaMalloc((void**)&d_O,  3 * width * height * sizeof(float));
 
-    #include <float.h> // dla FLT_MAX itd.
+    dim3 dimBlock(TILE_SIZE, TILE_SIZE, 1);
+    dim3 dimGrid((width + TILE_SIZE - 1) / TILE_SIZE, (height + TILE_SIZE - 1) / TILE_SIZE, 1);
+    FlowToRGB_Kernel<<<dimGrid, dimBlock>>>(d_u, d_v, d_O, width, height);
+    cudaDeviceSynchronize();
 
-    float minVal = FLT_MAX;
-    float maxVal = -FLT_MAX;
-
-    for (int i = 0; i < width * height; i++) {
-        if (hFlow[i] < minVal) minVal = hFlow[i];
-        if (hFlow[i] > maxVal) maxVal = hFlow[i];
-    }
-    printf("Zakres flow: min=%.6f, max=%.6f\n", minVal, maxVal);
-
-    int countOver = 0;
-    float threshold = 0.5f;
-    for (int i = 0; i < width * height; i++) {
-        if (hFlow[i] > threshold) {
-            countOver++;
-        }
-    }
-    printf("Liczba pikseli, gdzie flow > %.1f = %d\n", threshold, countOver);
-    float scale = 255.0f / 0.818741f;  // np. dynamicznie liczone: (255.0f / maxVal)
-    for (int i = 0; i < width*height; i++) {
-        hFlow[i] *= scale;
-    }
-    // teraz w hFlow mamy zakres ~0..255
+    // Kopiowanie wyników z GPU
+    float* h_O = (float*)malloc(3 * width * height * sizeof(float));
+    cudaMemcpy(h_O, d_O, 3 * width * height * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Zapis do BMP
-    writeBMP("flow_magnitude.bmp", hFlow, width, height, true);
-    printf("DEBUG: Magnituda przepływu, pierwsze 10:\n");
-    for (int i = 0; i < 10; i++) {
-        printf("%.3f ", hFlow[i]);
-    }
-    printf("\n");
-
-
-    // Opcjonalnie odczytajmy z powrotem i wyświetlmy parę pikseli:
-    float* hFlowCheck = (float*)malloc(width * height * sizeof(float));
-    readBMP("flow_magnitude.bmp", hFlowCheck, true);
-
-    printf("Pierwsze 10 pikseli obrazu zapisanego (flow_magnitude.bmp):\n");
-    for (int i = 0; i < 10; i++) {
-        printf("%.1f ", hFlowCheck[i]);
-    }
-    printf("\n");
-
-    free(hFlowCheck);
-    printf("Wynik zapisano do flow_magnitude.bmp\n");
+    try:
+        writeBMP(output_file, h_O, width, height, false);
+        printf("Zapisano plik flow.bmp\n");
+    except:
+        printf("Nie udało się zapisać pliku flow.bmp\n");    
 
     // Zwolnienie pamięci
-    free(hN1);
-    free(hN2);
-    free(hU);
-    free(hV);
-    free(hFlow);
+    free(h_N1);
+    free(h_N2);
+    free(h_u);
+    free(h_v);
+    free(h_O);
 
-    cudaFree(dN1);
-    cudaFree(dN2);
-    cudaFree(dIx);
-    cudaFree(dIy);
-    cudaFree(dIt);
-    cudaFree(dU);
-    cudaFree(dV);
+    cudaFree(d_N1);
+    cudaFree(d_N2);
+    cudaFree(d_u);
+    cudaFree(d_v);
+    cudaFree(d_O);
 
     return 0;
 }
