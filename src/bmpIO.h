@@ -76,10 +76,12 @@ inline void readBMP(const char *filename, float *image, bool isGray = 0) {
     for (unsigned int y = 0; y < height; ++y) {
         for (unsigned int x = 0; x < width; ++x) {
             unsigned int idx = y * row_padded + x * (isGray ? 1 : 3);
-            if (!isGray) {
-                image[(height - 1 - y) * width * 3 + x * 3] = (float)tempImage[idx + 2]; // Red
-                image[(height - 1 - y) * width * 3 + x * 3 + 1] = (float)tempImage[idx + 1]; // Green
-                image[(height - 1 - y) * width * 3 + x * 3 + 2] = (float)tempImage[idx]; // Blue
+            if (isGray) {
+                image[(height - 1 - y) * width + x] = (float)tempImage[idx];
+            } else {
+                // Uśrednienie dla RGB do grayscale
+                float gray = 0.299f * tempImage[idx + 2] + 0.587f * tempImage[idx + 1] + 0.114f * tempImage[idx];
+                image[(height - 1 - y) * width + x] = gray;
             }
         }
     }
@@ -100,8 +102,8 @@ void writeBMP(const char *filename, float *image, unsigned int width, unsigned i
 
     BMPHeader header = {};
     header.bfType = 0x4D42;
-    header.bfSize = sizeof(BMPHeader) + (isGray ? 256 * 4 : 0) + imageSize;
-    header.bfOffBits = sizeof(BMPHeader) + (isGray ? 256 * 4 : 0);
+    header.bfSize = sizeof(BMPHeader) + imageSize;
+    header.bfOffBits = sizeof(BMPHeader);
     header.biSize = 40;
     header.biWidth = width;
     header.biHeight = height;
@@ -112,42 +114,23 @@ void writeBMP(const char *filename, float *image, unsigned int width, unsigned i
     fwrite(&header, sizeof(BMPHeader), 1, fp);
 
     unsigned char *tempImage = (unsigned char *)calloc(row_padded * height, sizeof(unsigned char));
-    
-    if (isGray) {
-        unsigned char palette[256 * 4]; // 256 kolorów, każdy 4 bajty (RGBA)
-        for (int i = 0; i < 256; ++i) {
-            palette[i * 4 + 0] = i; // Blue
-            palette[i * 4 + 1] = i; // Green
-            palette[i * 4 + 2] = i; // Red
-            palette[i * 4 + 3] = 0; // Reserved
-        }
-        fwrite(palette, sizeof(unsigned char), 256 * 4, fp);
-    }
 
     for (unsigned int y = 0; y < height; ++y) {
         for (unsigned int x = 0; x < width; ++x) {
             unsigned int idx = y * row_padded + x * (isGray ? 1 : 3);
-            float val = image[(height - 1 - y) * width + x];
+            float val = 10.0f * image[(height - 1 - y) * width + x];
             unsigned char pixel = (unsigned char)fminf(fmaxf(val, 0.0f), 255.0f);
 
             //unsigned char pixel = (unsigned char)image[(height - 1 - y) * width + x];
             //unsigned char pixel = (unsigned char)fminf(fmaxf(image[(height - 1 - y) * width + x], 0.0f), 255.0f);
 
-            // if (isGray) {
-            //     tempImage[idx] = pixel;
-            // } else {
-            //     tempImage[idx] = pixel;
-            //     tempImage[idx + 1] = pixel;
-            //     tempImage[idx + 2] = pixel;
-            // }
             if (isGray) {
-                tempImage[idx] = (unsigned char)fminf(fmaxf(val, 0.0f), 255.0f);
+                tempImage[idx] = pixel;
             } else {
-                tempImage[idx] = (unsigned char)fminf(fmaxf(image[(height - 1 - y) * width * 3 + x * 3 + 2], 0.0f), 255.0f); // Blue
-                tempImage[idx + 1] = (unsigned char)fminf(fmaxf(image[(height - 1 - y) * width * 3 + x * 3 + 1], 0.0f), 255.0f); // Green
-                tempImage[idx + 2] = (unsigned char)fminf(fmaxf(image[(height - 1 - y) * width * 3 + x * 3], 0.0f), 255.0f); // Red
+                tempImage[idx] = pixel;
+                tempImage[idx + 1] = pixel;
+                tempImage[idx + 2] = pixel;
             }
-
         }
     }
 
