@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <math.h>
 
 #pragma pack(push, 1) // Wyrównanie do 1 bajta dla nagłówka BMP
 struct BMPHeader {
